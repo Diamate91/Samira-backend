@@ -6,7 +6,7 @@ import { Resend } from "resend";
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = Number(process.env.PORT) || 3001;
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -21,27 +21,36 @@ const escapeHtml = (input = "") =>
 
 const isValidEmail = (email = "") => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 
+const normalizeFrom = (from) => {
+  if (!from) return "Wróżka Samira <kontakt@wrozka-samira.pl>";
+  if (!from.includes("<") && from.includes("@")) return `Wróżka Samira <${from}>`;
+  return from;
+};
+
 // CORS (dev + prod)
 const allowedOrigins = [
-  process.env.FRONTEND_URL, // np. http://localhost:5173
-  process.env.SITE_URL, // np. https://www.wrozka-samira.pl
+  process.env.FRONTEND_URL, // np. http://localhost:5173 albo https://wrozka-samira.pl
+  process.env.SITE_URL,     // np. https://wrozka-samira.pl lub https://www.wrozka-samira.pl
+  "https://wrozka-samira.pl",
+  "https://www.wrozka-samira.pl",
+  "http://localhost:5173",
 ].filter(Boolean);
 
 app.use(
   cors({
     origin: (origin, cb) => {
-      // pozwól na brak origin (np. curl/postman)
       if (!origin) return cb(null, true);
-
-      // jeśli frontend i backend są na tej samej domenie, przeglądarka i tak traktuje to jako same-origin
       if (allowedOrigins.includes(origin)) return cb(null, true);
-
       return cb(new Error(`CORS blocked for origin: ${origin}`));
     },
-    methods: ["GET", "POST"],
-    credentials: true,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type"],
+    credentials: false,
   })
 );
+
+// Preflight
+app.options("*", cors());
 
 app.use(express.json({ limit: "100kb" }));
 app.use(express.urlencoded({ extended: true, limit: "100kb" }));
@@ -49,17 +58,21 @@ app.use(express.urlencoded({ extended: true, limit: "100kb" }));
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    message: "Wiedźma Samira Backend API is running",
+    message: "Wrozka Samira Backend API is running",
     timestamp: new Date().toISOString(),
+    env: process.env.NODE_ENV || "unknown",
   });
 });
 
 // POST /api/send-email
 app.post("/api/send-email", async (req, res) => {
   try {
-    const { name, email, service, message } = req.body ?? {};
+    const body = req.body || {};
+    const name = body.name;
+    const email = body.email;
+    const service = body.service;
+    const message = body.message;
 
-    // Basic request log (bez nagłówków i bez pełnego body)
     console.log("\n" + "=".repeat(80));
     console.log("📧 NEW EMAIL REQUEST");
     console.log("⏰", new Date().toLocaleString("pl-PL"));
@@ -87,8 +100,7 @@ app.post("/api/send-email", async (req, res) => {
       });
     }
 
-    // ENV config
-    const ownerTo = process.env.OWNER_EMAIL; // np. twojawrozkasamira@gmail.com
+    const ownerTo = process.env.OWNER_EMAIL;
     if (!ownerTo) {
       return res.status(500).json({
         success: false,
@@ -96,21 +108,26 @@ app.post("/api/send-email", async (req, res) => {
       });
     }
 
-    // Wysyłaj zawsze z własnej domeny (po weryfikacji w Resend)
-    // Najlepiej w formacie: "Wróżka Samira <kontakt@wrozka-samira.pl>"
-    const from = process.env.RESEND_FROM_EMAIL || "kontakt@wrozka-samira.pl";
+    if (!process.env.RESEND_API_KEY) {
+      return res.status(500).json({
+        success: false,
+        message: "Brak konfiguracji RESEND_API_KEY na serwerze.",
+      });
+    }
 
-    // Sanitization do HTML
+    const from = normalizeFrom(process.env.RESEND_FROM_EMAIL);
+
+    // Sanitization
     const safeName = escapeHtml(name);
     const safeEmail = escapeHtml(email);
     const safeService = escapeHtml(service);
     const safeMessage = escapeHtml(message).replace(/\n/g, "<br>");
 
-    // 1) Mail do właściciela (Reply-To ustaw na klienta)
+    // 1) Mail do właściciela
     const ownerEmail = await resend.emails.send({
       from,
       to: ownerTo,
-      replyTo: email, // klikniesz "Odpowiedz" i leci do klienta
+      replyTo: email,
       subject: `🌙 Nowa wiadomość od ${safeName} - ${safeService}`,
       html: `<!DOCTYPE html>
 <html>
@@ -157,10 +174,10 @@ app.post("/api/send-email", async (req, res) => {
 </html>`,
     });
 
-    if (ownerEmail?.error) {
+    if (ownerEmail && ownerEmail.error) {
       throw new Error(`Owner email failed: ${ownerEmail.error.message}`);
     }
-    if (!ownerEmail?.data?.id) {
+    if (!ownerEmail || !ownerEmail.data || !ownerEmail.data.id) {
       throw new Error("Owner email failed: no id returned from Resend");
     }
 
@@ -168,7 +185,7 @@ app.post("/api/send-email", async (req, res) => {
     const autoReply = await resend.emails.send({
       from,
       to: email,
-      replyTo: ownerTo, // ważne: poprawia deliverability, pozwala odpisać do Ciebie
+      replyTo: ownerTo,
       subject: "Dziękuję za kontakt",
       html: `<!DOCTYPE html>
 <html>
@@ -215,31 +232,32 @@ app.post("/api/send-email", async (req, res) => {
 </html>`,
     });
 
-    if (autoReply?.error) {
+    if (autoReply && autoReply.error) {
       throw new Error(`Auto-reply failed: ${autoReply.error.message}`);
     }
-    if (!autoReply?.data?.id) {
+    if (!autoReply || !autoReply.data || !autoReply.data.id) {
       throw new Error("Auto-reply failed: no id returned from Resend");
     }
 
     return res.status(200).json({
       success: true,
-      message:
-        "Email wysłany pomyślnie! Otrzymasz odpowiedź w ciągu 24 godzin. 🌙",
+      message: "Email wysłany pomyślnie! Otrzymasz odpowiedź w ciągu 24 godzin. 🌙",
       data: {
         ownerEmailId: ownerEmail.data.id,
         autoReplyId: autoReply.data.id,
         totalSent: 2,
       },
     });
-  } catch (error) {
-    console.error("❌ ERROR SENDING EMAIL:", error?.message);
+  } catch (err) {
+    const msg =
+      (err && err.message) ? err.message : (typeof err === "string" ? err : "Unknown error");
+
+    console.error("❌ ERROR SENDING EMAIL:", msg);
 
     return res.status(500).json({
       success: false,
-      message:
-        "Wystąpił błąd podczas wysyłania wiadomości. Spróbuj ponownie później.",
-      error: process.env.NODE_ENV === "development" ? error?.message : undefined,
+      message: "Wystąpił błąd podczas wysyłania wiadomości. Spróbuj ponownie później.",
+      error: process.env.NODE_ENV === "development" ? msg : undefined,
     });
   }
 });
@@ -253,13 +271,10 @@ app.use((req, res) => {
   });
 });
 
-/**
- * Vercel:
- * - w produkcji NIE odpalamy listen()
- * - eksportujemy app jako handler dla Serverless Function
- */
+// Vercel: eksport app jako handler
 export default app;
 
+// Lokalnie odpalamy listen()
 if (process.env.VERCEL !== "1") {
   app.listen(PORT, () => {
     console.log("✅ Server running on:", `http://localhost:${PORT}`);
@@ -269,10 +284,7 @@ if (process.env.VERCEL !== "1") {
       "🔐 Resend API Key:",
       process.env.RESEND_API_KEY ? "✅ Configured" : "❌ Missing"
     );
-    console.log(
-      "📨 Owner Email:",
-      process.env.OWNER_EMAIL || "❌ Missing OWNER_EMAIL"
-    );
+    console.log("📨 Owner Email:", process.env.OWNER_EMAIL || "❌ Missing OWNER_EMAIL");
     console.log(
       "🌐 Allowed origins:",
       allowedOrigins.length ? allowedOrigins : "⚠️ none (CORS will block)"
